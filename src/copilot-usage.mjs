@@ -1,0 +1,264 @@
+#!/usr/bin/env node
+
+import { aggregateCreditUsage, aggregateUserMetrics, normalizeAiCreditBudgets } from "./aggregate.mjs";
+import { GitHubApiError, GitHubClient } from "./github-api.mjs";
+
+function usage() {
+  return `Usage:
+  node src/copilot-usage.mjs --scope organization --slug ORG [options]
+  node src/copilot-usage.mjs --scope enterprise --slug ENTERPRISE [options]
+
+Options:
+  --scope TYPE          organization or enterprise
+  --slug NAME           Organization login or enterprise slug
+  --year YYYY           Billing year; defaults to current UTC year
+  --month MM            Billing month; defaults to current UTC month
+  --no-users            Skip month-to-date per-user metrics
+  --user-report-day DAY Fetch one day instead of month-to-date (diagnostic)
+  --pretty              Pretty-print JSON
+  --help                Show this help
+
+Authentication:
+  Set GITHUB_TOKEN or GH_TOKEN in the environment.
+`;
+}
+
+export function parseArgs(argv, now = new Date()) {
+  const options = {
+    year: now.getUTCFullYear(),
+    month: now.getUTCMonth() + 1,
+    includeUsers: true,
+    pretty: false,
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === "--pretty") {
+      options.pretty = true;
+    } else if (argument === "--no-users") {
+      options.includeUsers = false;
+    } else if (argument === "--help") {
+      options.help = true;
+    } else if (argument.startsWith("--")) {
+      const value = argv[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error(`Missing value for ${argument}`);
+      }
+      index += 1;
+      if (argument === "--scope") options.scope = value;
+      else if (argument === "--slug") options.slug = value;
+      else if (argument === "--year") options.year = Number(value);
+      else if (argument === "--month") options.month = Number(value);
+      else if (argument === "--user-report-day") {
+        options.userReportDay = value;
+        options.includeUsers = true;
+      }
+      else throw new Error(`Unknown option: ${argument}`);
+    } else {
+      throw new Error(`Unexpected argument: ${argument}`);
+    }
+  }
+
+  if (options.help) {
+    return options;
+  }
+  if (!["organization", "enterprise"].includes(options.scope)) {
+    throw new Error("--scope must be organization or enterprise");
+  }
+  if (!options.slug) {
+    throw new Error("--slug is required");
+  }
+  if (!Number.isInteger(options.year) || options.year < 2000) {
+    throw new Error("--year must be a four-digit year");
+  }
+  if (!Number.isInteger(options.month) || options.month < 1 || options.month > 12) {
+    throw new Error("--month must be between 1 and 12");
+  }
+  if (
+    options.userReportDay &&
+    !/^\d{4}-\d{2}-\d{2}$/.test(options.userReportDay)
+  ) {
+    throw new Error("--user-report-day must use YYYY-MM-DD");
+  }
+
+  return options;
+}
+
+export function getMonthReportDays({ year, month }, now = new Date()) {
+  const firstDay = new Date(Date.UTC(year, month - 1, 1));
+  const lastDay = new Date(Date.UTC(year, month, 0));
+  const today = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+  ));
+  const yesterday = new Date(today);
+  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+  const endDay = lastDay < yesterday ? lastDay : yesterday;
+
+  if (endDay < firstDay) {
+    return [];
+  }
+
+  const days = [];
+  for (
+    const day = new Date(firstDay);
+    day <= endDay;
+    day.setUTCDate(day.getUTCDate() + 1)
+  ) {
+    days.push(day.toISOString().slice(0, 10));
+  }
+  return days;
+}
+
+export async function buildReport(options, client) {
+  const scope = { type: options.scope, slug: options.slug };
+  const requests = [
+    client.getCreditUsage(options),
+    client.getBudgets(options),
+  ];
+
+  if (options.scope === "organization") {
+    requests.push(client.getOrganizationCopilotBilling(options.slug));
+  } else {
+    requests.push(client.getCopilotSeats(options));
+  }
+
+  if (options.userReportDay) {
+    requests.push(client.getUserReport({
+      scope: options.scope,
+      slug: options.slug,
+      day: options.userReportDay,
+    }).then((report) => ({
+      mode: "day",
+      startDay: options.userReportDay,
+      endDay: options.userReportDay,
+      records: report.records,
+      coverage: {
+        latest28Day: null,
+        targetDays: 1,
+        coveredByLatest28Day: 0,
+        dailyReportsRequested: 1,
+        dailyReportsWithContent: report.available ? 1 : 0,
+        noContentDays: report.available ? [] : [report.reportDay],
+      },
+    })));
+  } else if (options.includeUsers) {
+    const days = getMonthReportDays(options, options.now);
+    requests.push(client.getMonthUserReports({
+      scope: options.scope,
+      slug: options.slug,
+      days,
+    }).then((result) => ({
+      mode: "month-to-date",
+      startDay: days[0] ?? null,
+      endDay: days.at(-1) ?? null,
+      ...result,
+    })));
+  } else {
+    requests.push(Promise.resolve(null));
+  }
+
+  const [usage, budgets, copilotDetails, userReport] = await Promise.all(requests);
+  const credits = aggregateCreditUsage(usage?.usageItems);
+  const aiCreditBudgets = normalizeAiCreditBudgets(budgets);
+  const users = userReport ? aggregateUserMetrics(userReport.records) : null;
+  const userAnalyticsCredits = users
+    ? users.reduce((sum, user) => sum + user.aiCreditsUsed, 0)
+    : null;
+
+  return {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    scope,
+    period: usage?.timePeriod ?? {
+      year: options.year,
+      month: options.month,
+    },
+    credits: {
+      grossUsed: credits.grossUsed,
+      discounted: credits.discounted,
+      netBillable: credits.netBillable,
+      grossValueUsd: credits.grossValueUsd,
+      netChargeUsd: credits.netChargeUsd,
+    },
+    limits: {
+      includedCredits: null,
+      effectiveLimit: null,
+      percentUsed: null,
+      aiCreditBudgets,
+    },
+    copilot: options.scope === "organization"
+      ? {
+          planType: copilotDetails?.plan_type ?? null,
+          totalSeats: copilotDetails?.seat_breakdown?.total ?? null,
+          seatBreakdown: copilotDetails?.seat_breakdown ?? null,
+          assignmentRecordCount: null,
+        }
+      : {
+          planType: null,
+          totalSeats: copilotDetails?.totalSeats ?? null,
+          seatBreakdown: null,
+          assignmentRecordCount: copilotDetails?.seats?.length ?? null,
+        },
+    models: credits.models,
+    userMetrics: userReport
+      ? {
+          period: {
+            mode: userReport.mode,
+            startDay: userReport.startDay,
+            endDay: userReport.endDay,
+            ...userReport.coverage,
+          },
+          summary: {
+            userCount: users.length,
+            analyticsCreditsUsed: userAnalyticsCredits,
+            billingGrossCredits: credits.grossUsed,
+            differenceFromBilling: userAnalyticsCredits - credits.grossUsed,
+            expectedToReconcileWithBilling: false,
+          },
+          percentageBasis: {
+            interactions: "user_initiated_interaction_count",
+            codeGenerations: "code_generation_activity_count",
+          },
+          users,
+        }
+      : null,
+  };
+}
+
+async function main() {
+  let options;
+  try {
+    options = parseArgs(process.argv.slice(2));
+  } catch (error) {
+    console.error(`Error: ${error.message}\n`);
+    console.error(usage());
+    process.exitCode = 2;
+    return;
+  }
+
+  if (options.help) {
+    process.stdout.write(usage());
+    return;
+  }
+
+  try {
+    const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+    const client = new GitHubClient({ token });
+    const report = await buildReport(options, client);
+    const spacing = options.pretty ? 2 : 0;
+    process.stdout.write(`${JSON.stringify(report, null, spacing)}\n`);
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    if (error instanceof GitHubApiError && error.body) {
+      console.error(error.body);
+    }
+    process.exitCode = 1;
+  }
+}
+
+const isMain = process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+if (isMain) {
+  await main();
+}
