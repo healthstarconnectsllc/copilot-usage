@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 
-import { aggregateCreditUsage, aggregateUserMetrics, normalizeAiCreditBudgets } from "./aggregate.mjs";
+import {
+  aggregateCreditUsage,
+  aggregateUserMetrics,
+  attachUserCreditUsage,
+  normalizeAiCreditBudgets,
+} from "./aggregate.mjs";
 import { GitHubApiError, GitHubClient } from "./github-api.mjs";
 
 function usage() {
   return `Usage:
-  node src/copilot-usage.mjs --scope organization --slug ORG [options]
-  node src/copilot-usage.mjs --scope enterprise --slug ENTERPRISE [options]
+  node src/copilot-usage.mjs --enterprise ENTERPRISE_SLUG [options]
 
 Options:
-  --scope TYPE          organization or enterprise
-  --slug NAME           Organization login or enterprise slug
+  --enterprise SLUG     Enterprise slug
   --year YYYY           Billing year; defaults to current UTC year
   --month MM            Billing month; defaults to current UTC month
   --no-users            Skip month-to-date per-user metrics
@@ -45,8 +48,7 @@ export function parseArgs(argv, now = new Date()) {
         throw new Error(`Missing value for ${argument}`);
       }
       index += 1;
-      if (argument === "--scope") options.scope = value;
-      else if (argument === "--slug") options.slug = value;
+      if (argument === "--enterprise") options.enterprise = value;
       else if (argument === "--year") options.year = Number(value);
       else if (argument === "--month") options.month = Number(value);
       else if (argument === "--user-report-day") {
@@ -62,11 +64,8 @@ export function parseArgs(argv, now = new Date()) {
   if (options.help) {
     return options;
   }
-  if (!["organization", "enterprise"].includes(options.scope)) {
-    throw new Error("--scope must be organization or enterprise");
-  }
-  if (!options.slug) {
-    throw new Error("--slug is required");
+  if (!options.enterprise) {
+    throw new Error("--enterprise is required");
   }
   if (!Number.isInteger(options.year) || options.year < 2000) {
     throw new Error("--year must be a four-digit year");
@@ -112,22 +111,15 @@ export function getMonthReportDays({ year, month }, now = new Date()) {
 }
 
 export async function buildReport(options, client) {
-  const scope = { type: options.scope, slug: options.slug };
   const requests = [
     client.getCreditUsage(options),
     client.getBudgets(options),
+    client.getCopilotSeats(options),
   ];
-
-  if (options.scope === "organization") {
-    requests.push(client.getOrganizationCopilotBilling(options.slug));
-  } else {
-    requests.push(client.getCopilotSeats(options));
-  }
 
   if (options.userReportDay) {
     requests.push(client.getUserReport({
-      scope: options.scope,
-      slug: options.slug,
+      enterprise: options.enterprise,
       day: options.userReportDay,
     }).then((report) => ({
       mode: "day",
@@ -146,8 +138,7 @@ export async function buildReport(options, client) {
   } else if (options.includeUsers) {
     const days = getMonthReportDays(options, options.now);
     requests.push(client.getMonthUserReports({
-      scope: options.scope,
-      slug: options.slug,
+      enterprise: options.enterprise,
       days,
     }).then((result) => ({
       mode: "month-to-date",
@@ -162,15 +153,34 @@ export async function buildReport(options, client) {
   const [usage, budgets, copilotDetails, userReport] = await Promise.all(requests);
   const credits = aggregateCreditUsage(usage?.usageItems);
   const aiCreditBudgets = normalizeAiCreditBudgets(budgets);
-  const users = userReport ? aggregateUserMetrics(userReport.records) : null;
+  const aggregatedUsers = userReport
+    ? aggregateUserMetrics(userReport.records)
+    : null;
+  const userCreditUsage = aggregatedUsers
+    ? await client.getUserCreditUsageReports({
+        enterprise: options.enterprise,
+        year: options.year,
+        month: options.month,
+        users: aggregatedUsers,
+      })
+    : null;
+  const users = aggregatedUsers
+    ? attachUserCreditUsage(aggregatedUsers, userCreditUsage.reports)
+    : null;
   const userAnalyticsCredits = users
     ? users.reduce((sum, user) => sum + user.aiCreditsUsed, 0)
+    : null;
+  const attributedBillingGrossCredits = users
+    ? users.reduce(
+        (sum, user) => sum + (user.billingCredits?.grossUsed ?? 0),
+        0,
+      )
     : null;
 
   return {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
-    scope,
+    scope: { type: "enterprise", slug: options.enterprise },
     period: usage?.timePeriod ?? {
       year: options.year,
       month: options.month,
@@ -188,19 +198,12 @@ export async function buildReport(options, client) {
       percentUsed: null,
       aiCreditBudgets,
     },
-    copilot: options.scope === "organization"
-      ? {
-          planType: copilotDetails?.plan_type ?? null,
-          totalSeats: copilotDetails?.seat_breakdown?.total ?? null,
-          seatBreakdown: copilotDetails?.seat_breakdown ?? null,
-          assignmentRecordCount: null,
-        }
-      : {
-          planType: null,
-          totalSeats: copilotDetails?.totalSeats ?? null,
-          seatBreakdown: null,
-          assignmentRecordCount: copilotDetails?.seats?.length ?? null,
-        },
+    copilot: {
+      planType: null,
+      totalSeats: copilotDetails?.totalSeats ?? null,
+      seatBreakdown: null,
+      assignmentRecordCount: copilotDetails?.seats?.length ?? null,
+    },
     models: credits.models,
     userMetrics: userReport
       ? {
@@ -216,11 +219,22 @@ export async function buildReport(options, client) {
             billingGrossCredits: credits.grossUsed,
             differenceFromBilling: userAnalyticsCredits - credits.grossUsed,
             expectedToReconcileWithBilling: false,
+            billingBreakdown: {
+              requestedUserCount: users.length,
+              successfulUserCount: userCreditUsage.reports.length,
+              failedUserCount: userCreditUsage.failures.length,
+              complete: userCreditUsage.failures.length === 0,
+              attributedGrossCredits: attributedBillingGrossCredits,
+              unattributedGrossCredits:
+                credits.grossUsed - attributedBillingGrossCredits,
+            },
           },
           percentageBasis: {
+            billingCredits: "grossQuantity",
             interactions: "user_initiated_interaction_count",
             codeGenerations: "code_generation_activity_count",
           },
+          billingFailures: userCreditUsage.failures,
           users,
         }
       : null,

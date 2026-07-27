@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   aggregateCreditUsage,
   aggregateUserMetrics,
+  attachUserCreditUsage,
   normalizeAiCreditBudgets,
 } from "../src/aggregate.mjs";
 import {
@@ -44,7 +45,7 @@ test("normalizeAiCreditBudgets excludes unrelated product budgets", () => {
     {
       id: "ai",
       budget_product_skus: ["ai_credits"],
-      budget_scope: "organization",
+      budget_scope: "enterprise",
       budget_amount: 50,
       prevent_further_usage: true,
     },
@@ -58,7 +59,7 @@ test("normalizeAiCreditBudgets excludes unrelated product budgets", () => {
   assert.deepEqual(result, [
     {
       id: "ai",
-      scope: "organization",
+      scope: "enterprise",
       entityName: null,
       amountUsd: 50,
       equivalentCredits: 5000,
@@ -126,20 +127,55 @@ test("aggregateUserMetrics groups renamed users by stable user_id", () => {
   assert.equal(result.find((user) => user.userId === 42).aiCreditsUsed, 5);
 });
 
-test("parseArgs applies UTC defaults and validates scope", () => {
+test("attachUserCreditUsage adds credit-based model percentages by stable ID", () => {
+  const users = [{ userId: 42, userLogin: "new-login", models: [] }];
+  const result = attachUserCreditUsage(users, [{
+    userId: 42,
+    userLogin: "new-login",
+    usage: {
+      usageItems: [
+        {
+          model: "Model A",
+          grossQuantity: 30,
+          discountQuantity: 30,
+          netQuantity: 0,
+          grossAmount: 0.3,
+          netAmount: 0,
+        },
+        {
+          model: "Model B",
+          grossQuantity: 10,
+          discountQuantity: 5,
+          netQuantity: 5,
+          grossAmount: 0.1,
+          netAmount: 0.05,
+        },
+      ],
+    },
+  }]);
+
+  assert.equal(result[0].billingCredits.grossUsed, 40);
+  assert.equal(
+    result[0].billingCredits.models[0].percentageOfGrossCredits,
+    75,
+  );
+  assert.equal(result[0].billingCredits.models[1].percentageOfGrossCredits, 25);
+});
+
+test("parseArgs applies UTC defaults and requires an enterprise", () => {
   const now = new Date("2026-07-26T12:00:00Z");
   const options = parseArgs(
-    ["--scope", "organization", "--slug", "example"],
+    ["--enterprise", "example-enterprise"],
     now,
   );
 
   assert.equal(options.year, 2026);
   assert.equal(options.month, 7);
-  assert.equal(options.slug, "example");
+  assert.equal(options.enterprise, "example-enterprise");
   assert.equal(options.includeUsers, true);
   assert.throws(
-    () => parseArgs(["--scope", "account", "--slug", "example"], now),
-    /--scope must be organization or enterprise/,
+    () => parseArgs([], now),
+    /--enterprise is required/,
   );
 });
 
@@ -171,13 +207,17 @@ test("buildReport aggregates daily user records for the month", async () => {
   const client = {
     getCreditUsage: async () => ({
       timePeriod: { year: 2026, month: 7 },
-      usageItems: [],
+      usageItems: [{
+        model: "Model A",
+        grossQuantity: 25,
+        discountQuantity: 25,
+        netQuantity: 0,
+        grossAmount: 0.25,
+        netAmount: 0,
+      }],
     }),
     getBudgets: async () => [],
-    getOrganizationCopilotBilling: async () => ({
-      plan_type: "business",
-      seat_breakdown: { total: 1 },
-    }),
+    getCopilotSeats: async () => ({ totalSeats: 1, seats: [{}] }),
     getMonthUserReports: async ({ days }) => ({
       coverage: {
         latest28Day: {
@@ -207,11 +247,27 @@ test("buildReport aggregates daily user records for the month", async () => {
         },
       ],
     }),
+    getUserCreditUsageReports: async ({ users }) => ({
+      reports: [{
+        userId: users[0].userId,
+        userLogin: users[0].userLogin,
+        usage: {
+          usageItems: [{
+            model: "Model A",
+            grossQuantity: 20,
+            discountQuantity: 20,
+            netQuantity: 0,
+            grossAmount: 0.2,
+            netAmount: 0,
+          }],
+        },
+      }],
+      failures: [],
+    }),
   };
   const report = await buildReport(
     {
-      scope: "organization",
-      slug: "example",
+      enterprise: "example-enterprise",
       year: 2026,
       month: 7,
       includeUsers: true,
@@ -229,6 +285,16 @@ test("buildReport aggregates daily user records for the month", async () => {
   assert.equal(report.userMetrics.summary.expectedToReconcileWithBilling, false);
   assert.equal(report.userMetrics.users[0].aiCreditsUsed, 25);
   assert.equal(report.userMetrics.users[0].userInitiatedInteractions, 5);
+  assert.equal(report.userMetrics.users[0].billingCredits.grossUsed, 20);
+  assert.equal(
+    report.userMetrics.users[0].billingCredits.models[0]
+      .percentageOfGrossCredits,
+    100,
+  );
+  assert.equal(report.userMetrics.summary.billingBreakdown.successfulUserCount, 1);
+  assert.equal(report.userMetrics.summary.billingBreakdown.complete, true);
+  assert.equal(report.userMetrics.summary.billingBreakdown.unattributedGrossCredits, 5);
+  assert.deepEqual(report.userMetrics.billingFailures, []);
 });
 
 test("buildReport emits the same normalized enterprise shape", async () => {
@@ -242,8 +308,7 @@ test("buildReport emits the same normalized enterprise shape", async () => {
   };
   const report = await buildReport(
     {
-      scope: "enterprise",
-      slug: "example-enterprise",
+      enterprise: "example-enterprise",
       year: 2026,
       month: 7,
       includeUsers: false,

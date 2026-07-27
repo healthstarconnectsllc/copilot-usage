@@ -76,6 +76,40 @@ export function validateLatestUserReportEnvelope(report) {
   };
 }
 
+export function validateAiCreditUsageReport(report) {
+  if (!report || typeof report !== "object" || Array.isArray(report)) {
+    throw new Error("Billing AI credit usage response is invalid");
+  }
+  if (!report.timePeriod || typeof report.timePeriod !== "object") {
+    throw new Error("Billing AI credit usage response has no time period");
+  }
+  if (!Array.isArray(report.usageItems)) {
+    throw new Error("Billing AI credit usage response has no usageItems array");
+  }
+
+  for (const item of report.usageItems) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("Billing AI credit usage response contains an invalid item");
+    }
+    if (typeof item.model !== "string" || !item.model) {
+      throw new Error("Billing AI credit usage item has no model");
+    }
+    for (const field of [
+      "grossQuantity",
+      "discountQuantity",
+      "netQuantity",
+      "grossAmount",
+      "netAmount",
+    ]) {
+      if (typeof item[field] !== "number" || !Number.isFinite(item[field])) {
+        throw new Error(`Billing AI credit usage item has invalid ${field}`);
+      }
+    }
+  }
+
+  return report;
+}
+
 function validateUserRecord(record, range) {
   if (!record || typeof record !== "object" || Array.isArray(record)) {
     throw new Error("User metrics report contains an invalid record");
@@ -152,25 +186,81 @@ export class GitHubClient {
     return response.json();
   }
 
-  async getCreditUsage({ scope, slug, year, month }) {
-    const owner = scope === "enterprise" ? "enterprises" : "organizations";
+  async getCreditUsage({ enterprise, year, month, user }) {
     const query = new URLSearchParams({
       year: String(year),
       month: String(month),
     });
-    return this.request(
-      `/${owner}/${encodeURIComponent(slug)}/settings/billing/ai_credit/usage?${query}`,
+    if (user) {
+      query.set("user", user);
+    }
+    const report = await this.request(
+      `/enterprises/${encodeURIComponent(enterprise)}/settings/billing/ai_credit/usage?${query}`,
     );
+    return validateAiCreditUsageReport(report);
   }
 
-  async getBudgets({ scope, slug }) {
-    const owner = scope === "enterprise" ? "enterprises" : "organizations";
+  async getUserCreditUsageReports({
+    enterprise,
+    year,
+    month,
+    users,
+    concurrency = 5,
+  }) {
+    const outcomes = new Array(users.length);
+    let nextIndex = 0;
+
+    const worker = async () => {
+      while (nextIndex < users.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const user = users[index];
+
+        try {
+          const usage = await this.getCreditUsage({
+            enterprise,
+            year,
+            month,
+            user: user.userLogin,
+          });
+          outcomes[index] = {
+            ok: true,
+            userId: user.userId,
+            userLogin: user.userLogin,
+            usage,
+          };
+        } catch (error) {
+          outcomes[index] = {
+            ok: false,
+            userId: user.userId,
+            userLogin: user.userLogin,
+            status: Number.isInteger(error?.status) ? error.status : null,
+            message: error?.message || String(error),
+          };
+        }
+      }
+    };
+
+    const workerCount = Math.min(Math.max(1, concurrency), users.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    return {
+      reports: outcomes
+        .filter((outcome) => outcome.ok)
+        .map(({ ok, ...outcome }) => outcome),
+      failures: outcomes
+        .filter((outcome) => !outcome.ok)
+        .map(({ ok, ...outcome }) => outcome),
+    };
+  }
+
+  async getBudgets({ enterprise }) {
     const budgets = [];
     let page = 1;
 
     while (true) {
       const response = await this.request(
-        `/${owner}/${encodeURIComponent(slug)}/settings/billing/budgets?per_page=100&page=${page}`,
+        `/enterprises/${encodeURIComponent(enterprise)}/settings/billing/budgets?per_page=100&page=${page}`,
       );
       budgets.push(...(response?.budgets ?? []));
 
@@ -181,19 +271,14 @@ export class GitHubClient {
     }
   }
 
-  async getOrganizationCopilotBilling(slug) {
-    return this.request(`/orgs/${encodeURIComponent(slug)}/copilot/billing`);
-  }
-
-  async getCopilotSeats({ scope, slug }) {
-    const owner = scope === "enterprise" ? "enterprises" : "orgs";
+  async getCopilotSeats({ enterprise }) {
     const seats = [];
     let page = 1;
     let totalSeats = 0;
 
     while (true) {
       const response = await this.request(
-        `/${owner}/${encodeURIComponent(slug)}/copilot/billing/seats?per_page=100&page=${page}`,
+        `/enterprises/${encodeURIComponent(enterprise)}/copilot/billing/seats?per_page=100&page=${page}`,
       );
       const pageSeats = response?.seats ?? [];
       totalSeats = response?.total_seats ?? totalSeats;
@@ -206,11 +291,10 @@ export class GitHubClient {
     }
   }
 
-  async getUserReport({ scope, slug, day }) {
-    const owner = scope === "enterprise" ? "enterprises" : "orgs";
+  async getUserReport({ enterprise, day }) {
     const query = new URLSearchParams({ day });
     const report = await this.request(
-      `/${owner}/${encodeURIComponent(slug)}/copilot/metrics/reports/users-1-day?${query}`,
+      `/enterprises/${encodeURIComponent(enterprise)}/copilot/metrics/reports/users-1-day?${query}`,
     );
 
     if (!report) {
@@ -237,10 +321,9 @@ export class GitHubClient {
     };
   }
 
-  async getLatestUserReport({ scope, slug }) {
-    const owner = scope === "enterprise" ? "enterprises" : "orgs";
+  async getLatestUserReport({ enterprise }) {
     const report = await this.request(
-      `/${owner}/${encodeURIComponent(slug)}/copilot/metrics/reports/users-28-day/latest`,
+      `/enterprises/${encodeURIComponent(enterprise)}/copilot/metrics/reports/users-28-day/latest`,
     );
     const envelope = validateLatestUserReportEnvelope(report);
     const records = [];
@@ -262,7 +345,7 @@ export class GitHubClient {
     };
   }
 
-  async getUserReports({ scope, slug, days, concurrency = 5 }) {
+  async getUserReports({ enterprise, days, concurrency = 5 }) {
     const reports = new Array(days.length);
     let nextIndex = 0;
 
@@ -274,8 +357,7 @@ export class GitHubClient {
         const index = nextIndex;
         nextIndex += 1;
         reports[index] = await this.getUserReport({
-          scope,
-          slug,
+          enterprise,
           day: days[index],
         });
       }
@@ -290,7 +372,7 @@ export class GitHubClient {
     };
   }
 
-  async getMonthUserReports({ scope, slug, days }) {
+  async getMonthUserReports({ enterprise, days }) {
     if (days.length === 0) {
       return {
         records: [],
@@ -305,7 +387,7 @@ export class GitHubClient {
       };
     }
 
-    const latest = await this.getLatestUserReport({ scope, slug });
+    const latest = await this.getLatestUserReport({ enterprise });
     const targetDays = new Set(days);
     const coveredDays = days.filter(
       (day) => day >= latest.reportStartDay && day <= latest.reportEndDay,
@@ -313,7 +395,7 @@ export class GitHubClient {
     const dailyDays = days.filter(
       (day) => day < latest.reportStartDay || day > latest.reportEndDay,
     );
-    const daily = await this.getUserReports({ scope, slug, days: dailyDays });
+    const daily = await this.getUserReports({ enterprise, days: dailyDays });
     const records = [
       ...latest.records.filter((record) => targetDays.has(record.day)),
       ...daily.records,

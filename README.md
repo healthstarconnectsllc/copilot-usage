@@ -8,10 +8,12 @@ are written to stderr so stdout can be redirected safely.
 
 ```bash
 GITHUB_TOKEN="$(gh auth token)" node src/copilot-usage.mjs \
-  --scope organization \
-  --slug ORGANIZATION_LOGIN \
+  --enterprise ENTERPRISE_SLUG \
   --pretty
 ```
+
+All GitHub API requests use enterprise endpoints. The token owner must have the
+required enterprise billing, Copilot metrics, and Copilot seat permissions.
 
 By default, the CLI downloads the latest rolling 28-day user report, keeps only
 records whose `day` belongs to the selected month, and requests individual daily
@@ -23,8 +25,7 @@ Fetch one day instead for diagnostics:
 
 ```bash
 GITHUB_TOKEN="$(gh auth token)" node src/copilot-usage.mjs \
-  --scope organization \
-  --slug ORGANIZATION_LOGIN \
+  --enterprise ENTERPRISE_SLUG \
   --user-report-day 2026-07-25 \
   --pretty
 ```
@@ -33,22 +34,8 @@ Redirect stdout when a file is useful:
 
 ```bash
 GITHUB_TOKEN="$(gh auth token)" node src/copilot-usage.mjs \
-  --scope organization \
-  --slug ORGANIZATION_LOGIN > copilot-usage.json
+  --enterprise ENTERPRISE_SLUG > copilot-usage.json
 ```
-
-## Enterprise testing
-
-Use the same CLI with an enterprise-authorized token:
-
-```bash
-GITHUB_TOKEN="..." node src/copilot-usage.mjs \
-  --scope enterprise \
-  --slug ENTERPRISE_SLUG
-```
-
-Organization and enterprise APIs use different endpoint paths. The CLI maps
-those paths internally and emits the same normalized output shape.
 
 The enterprise seat API can return more assignment records than unique billed
 seats when a user receives Copilot through multiple organizations or enterprise
@@ -62,18 +49,28 @@ teams. `copilot.totalSeats` is GitHub's unique billed-seat count, while
   the billing API.
 - `userMetrics.users[].aiCreditsUsed` is the user's aggregated total across the
   reports with content in `userMetrics.period`.
+- `userMetrics.users[].billingCredits` is fetched from the billing API by
+  filtering the selected enterprise month by that user's current login. Its
+  `models[].grossCredits` and
+  `models[].percentageOfGrossCredits` fields provide the credit-based per-model
+  breakdown. Results are attached to the stable usage-metrics `userId`.
 - `userMetrics.summary.analyticsCreditsUsed` is an analytics total, not a
   billing total. GitHub does not expect it to reconcile exactly with
   `credits.grossUsed`, and the output reports the observed difference rather
   than hiding it.
 - `userMetrics.period.noContentDays` lists dates for which GitHub returned HTTP
   204 instead of a downloadable user report.
-- User-level model percentages are activity-based because GitHub's daily user
-  report does not attribute AI credits to individual models. Both interaction
-  and code-generation percentage bases are named explicitly in the output.
+- `userMetrics.users[].models` remains the activity-based model breakdown from
+  Copilot usage metrics. GitHub does not put model-level credits in that report,
+  so the separate `billingCredits.models` breakdown comes from one filtered
+  billing request per reported user.
+- `userMetrics.billingFailures` lists user billing requests that did not
+  succeed. `userMetrics.summary.billingBreakdown` reports request completeness,
+  attributed gross credits, and the residual `unattributedGrossCredits` versus
+  the scope-level billing total so partial coverage cannot silently undercount.
 - Included pool and effective limit remain `null` unless a reliable billing-
-  entity-level source is added. Current organization seats are not treated as
-  the enterprise's shared pool.
+  entity-level source is added. Copilot seats are not treated as the
+  enterprise's shared credit pool.
 
 Month-to-date reports are currently recalculated on each run, although the
 rolling report substantially reduces API calls. A `TODO` in the report-fetching

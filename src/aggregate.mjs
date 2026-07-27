@@ -165,3 +165,32 @@ export function aggregateUserMetrics(records = []) {
     }))
     .sort((a, b) => b.aiCreditsUsed - a.aiCreditsUsed);
 }
+
+export function attachUserCreditUsage(users, reports = []) {
+  const reportsByUserId = new Map();
+
+  for (const report of reports) {
+    const key = String(report.userId);
+    if (reportsByUserId.has(key)) {
+      throw new Error(`Duplicate billing report for user_id ${report.userId}`);
+    }
+    reportsByUserId.set(key, aggregateCreditUsage(report.usage?.usageItems));
+  }
+
+  return users.map((user) => {
+    const credits = reportsByUserId.get(String(user.userId));
+    return {
+      ...user,
+      billingCredits: credits
+        ? {
+            grossUsed: credits.grossUsed,
+            discounted: credits.discounted,
+            netBillable: credits.netBillable,
+            grossValueUsd: credits.grossValueUsd,
+            netChargeUsd: credits.netChargeUsd,
+            models: credits.models,
+          }
+        : null,
+    };
+  });
+}
